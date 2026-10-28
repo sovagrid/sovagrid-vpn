@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright (C) 2026 Jigokuraku01
 # Additional author attribution terms: see ATTRIBUTION.md.
-# Remote VPS lab: two disposable containers on an internal Docker network.
+# Remote-host lab: two disposable containers on an internal Docker network.
 # All keys are generated inside the containers. No live Amnezia container is used.
 set -eu
 umask 077
