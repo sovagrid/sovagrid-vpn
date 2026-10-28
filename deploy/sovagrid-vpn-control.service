@@ -1,0 +1,25 @@
+[Unit]
+Description=SovaGrid managed WireGuard control broker
+Requires=sovagrid-vpn-control.socket
+After=sovagrid-vpn-control.socket
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 -I /usr/local/libexec/sovagrid-vpn-broker
+User=root
+Group=root
+Environment=PATH=/usr/sbin:/usr/bin:/sbin:/bin
+NoNewPrivileges=true
+UMask=0077
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/sovagrid-vpn /etc/wireguard
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW
+RestrictAddressFamilies=AF_UNIX AF_INET AF_NETLINK
+TasksMax=64
+MemoryMax=256M
+
+[Install]
+WantedBy=multi-user.target

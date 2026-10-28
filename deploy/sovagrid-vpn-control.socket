@@ -1,0 +1,13 @@
+[Unit]
+Description=SovaGrid managed WireGuard control socket
+
+[Socket]
+ListenStream=/run/sovagrid-vpn/control.sock
+SocketUser=root
+SocketGroup=sovagrid
+SocketMode=0660
+DirectoryMode=0755
+RemoveOnStop=yes
+
+[Install]
+WantedBy=sockets.target

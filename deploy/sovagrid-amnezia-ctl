@@ -1,0 +1,11 @@
+#!/usr/bin/python3 -I
+# Managed by SovaGrid optional Amnezia installer
+"""Unprivileged fixed-path client; all validation repeats in the broker."""
+
+import sys
+
+sys.path.insert(0, "/opt/sovagrid-vpn")
+from sovagrid_vpn.amnezia_control import client_main
+
+if __name__ == "__main__":
+    raise SystemExit(client_main())

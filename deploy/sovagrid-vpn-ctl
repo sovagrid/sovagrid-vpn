@@ -1,0 +1,11 @@
+#!/usr/bin/python3 -I
+# Managed by SovaGrid run.sh
+"""Unprivileged, fixed-path client for the SovaGrid VPN broker."""
+
+import sys
+
+sys.path.insert(0, "/opt/sovagrid-vpn")
+from sovagrid_vpn.control import client_main
+
+if __name__ == "__main__":
+    raise SystemExit(client_main())

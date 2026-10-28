@@ -1,0 +1,22 @@
+[Unit]
+Description=SovaGrid sanitized VPN inventory snapshot
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/sovagrid-vpn
+Environment=PYTHONDONTWRITEBYTECODE=1
+ExecStart=/usr/bin/python3 -m sovagrid_vpn --output /var/lib/sovagrid/vpn/status.json --group sovagrid-hub
+# Exit 2 means Docker was unavailable but the independent managed snapshot
+# was still written. Publication failures use exit 3 and remain unit failures.
+SuccessExitStatus=2
+User=root
+Group=root
+SupplementaryGroups=sovagrid-hub
+NoNewPrivileges=yes
+CapabilityBoundingSet=CAP_NET_ADMIN
+ProtectSystem=strict
+ReadWritePaths=/var/lib/sovagrid/vpn
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+RestrictAddressFamilies=AF_UNIX AF_NETLINK

@@ -1,0 +1,11 @@
+#!/usr/bin/python3 -I
+# Managed by SovaGrid optional Amnezia installer
+"""Load only the root-owned VPN package from its fixed installation path."""
+
+import sys
+
+sys.path.insert(0, "/opt/sovagrid-vpn")
+from sovagrid_vpn.amnezia_control import broker_main
+
+if __name__ == "__main__":
+    raise SystemExit(broker_main())

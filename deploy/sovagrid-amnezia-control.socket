@@ -1,0 +1,14 @@
+# Managed by SovaGrid optional Amnezia installer
+[Unit]
+Description=SovaGrid optional Amnezia control socket
+
+[Socket]
+ListenStream=/run/sovagrid-vpn/amnezia-control.sock
+SocketUser=root
+SocketGroup=sovagrid
+SocketMode=0660
+DirectoryMode=0755
+RemoveOnStop=yes
+
+[Install]
+WantedBy=sockets.target
