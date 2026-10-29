@@ -87,7 +87,7 @@ UDP-порт, VPN-подсеть, число клиентов и состоян�
 Пример схемы:
 
 ```json
-{"schema_version":1,"collected_at":1,"source":"docker_cli","source_status":"ok","services":[{"name":"amnezia-awg2","service":"AmneziaWG (awg2)","state":"running","health":"not_reported","published_ports":[{"port":42683,"protocol":"udp"}]}],"amnezia_details":{"schema_version":1,"collected_at":1,"source_status":"ok","services":[{"name":"amnezia-awg2","status":"ready","configured_clients":2,"runtime_clients":2,"awg3_fields":true,"active_last_3m":1,"latest_handshake_at":1,"received_bytes":1024,"sent_bytes":2048}]},"managed":{"source_status":"ok","instances":[{"name":"phone-vpn","interface":"sg615ed6c9020","port":51821,"subnet":"10.49.0.0/24","client_count":1,"state":"active"}]}}
+{"schema_version":1,"collected_at":1,"source":"docker_cli","source_status":"ok","services":[{"name":"amnezia-awg2","service":"AmneziaWG (awg2)","state":"running","health":"not_reported","published_ports":[{"port":51820,"protocol":"udp"}]}],"amnezia_details":{"schema_version":1,"collected_at":1,"source_status":"ok","services":[{"name":"amnezia-awg2","status":"ready","configured_clients":2,"runtime_clients":2,"awg3_fields":true,"active_last_3m":1,"latest_handshake_at":1,"received_bytes":1024,"sent_bytes":2048}]},"managed":{"source_status":"ok","instances":[{"name":"phone-vpn","interface":"sg615ed6c9020","port":51821,"subnet":"10.49.0.0/24","client_count":1,"state":"active"}]}}
 ```
 
 Для предварительной оценки отдельного **нового** WireGuard-инстанса остаётся
