@@ -41,6 +41,7 @@ LABEL = "io.sovagrid.amnezia-provision"
 SCHEMA_VERSION = 1
 MAX_STATE = 65536
 MAX_SOURCE = 1048576
+MAX_SOURCE_FILES = 64
 HEX = re.compile(r"[0-9a-f]{64}\Z")
 IMAGE_ID = re.compile(r"sha256:[0-9a-f]{64}\Z")
 
@@ -302,15 +303,25 @@ class Provisioner:
         source_root = Path(__file__).absolute().parent.parent
         if self.require_root and source_root != Path("/opt/sovagrid-src/sovagrid-vpn"):
             _fail("SOURCE_UNTRUSTED")
-        paths = (source_root / "sovagrid_vpn" / "amnezia_provision.py",
-                 source_root / "sovagrid_vpn" / "amnezia_admin.py",
-                 source_root / "deploy" / "sovagrid-amnezia-provision")
+        package = source_root / "sovagrid_vpn"
         directories = ((Path("/opt"), Path("/opt/sovagrid-src"))
                        if self.require_root else ())
-        for directory in (*directories, source_root, source_root / "sovagrid_vpn",
+        for directory in (*directories, source_root, package,
                           source_root / "deploy"):
             _secure_dir(directory, self.owner, private=False)
+        try:
+            modules = sorted((path for path in package.iterdir() if path.suffix == ".py"),
+                             key=lambda path: path.name)
+        except OSError:
+            _fail("SOURCE_UNTRUSTED")
+        required = {"__init__.py", "amnezia_provision.py", "amnezia_admin.py",
+                    "amnezia_install.py", "amnezia_profile.py", "sealed.py"}
+        if (not required.issubset({path.name for path in modules}) or
+                len(modules) > MAX_SOURCE_FILES):
+            _fail("SOURCE_UNTRUSTED")
+        paths = (*modules, source_root / "deploy" / "sovagrid-amnezia-provision")
         digest = hashlib.sha256()
+        total_size = 0
         for path in paths:
             try:
                 fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
@@ -319,6 +330,9 @@ class Provisioner:
                     if (not stat.S_ISREG(info.st_mode) or info.st_uid != self.owner or
                             info.st_nlink != 1 or info.st_mode & 0o022 or
                             info.st_size > MAX_SOURCE):
+                        _fail("SOURCE_UNTRUSTED")
+                    total_size += info.st_size
+                    if total_size > 4 * MAX_SOURCE:
                         _fail("SOURCE_UNTRUSTED")
                     raw = os.read(fd, MAX_SOURCE + 1)
                 finally:
@@ -412,6 +426,17 @@ class Provisioner:
         except (tarfile.TarError, OSError):
             _fail("MANUAL_RECOVERY_REQUIRED")
 
+    @staticmethod
+    def _installed_matches(state: dict, container: dict | None) -> bool:
+        return bool(container and state.get("installed") is True and
+                    state.get("image_ref") == PINNED_AWG_IMAGE and
+                    state.get("container_id") == container["id"] and
+                    state.get("image_id") == container["image_id"] and
+                    state.get("nonce") == container["nonce"] and
+                    container["image_ref"] in (PINNED_AWG_IMAGE,
+                                               "docker.io/" + PINNED_AWG_IMAGE) and
+                    container["running"])
+
     def _observe(self, port: int, subnet: str, route: str = "full") -> dict:
         self._root()
         network = _network(subnet)
@@ -431,7 +456,8 @@ class Provisioner:
         elif pending:
             reason = "RECOVERY_REQUIRED"
         elif state:
-            reason = "ALREADY_INSTALLED"
+            reason = ("ALREADY_INSTALLED" if self._installed_matches(state, container)
+                      else "INSTALLATION_DRIFT")
         elif container:
             reason = "CONTAINER_EXISTS"
         elif not self.tun_available():
@@ -492,6 +518,27 @@ class Provisioner:
 
     def _finalize(self, pending: dict) -> dict:
         self._health(pending)
+        # A healthy interface alone cannot prove the next boot will use the
+        # same startup/NAT script or PSK. Compare every file copied into the
+        # container before enabling automatic restart.
+        expected_names = {"opt/amnezia/awg/awg0.conf", "opt/amnezia/awg/clientsTable",
+                          "opt/amnezia/awg/wireguard_psk.key", "opt/amnezia/start.sh"}
+        files = pending.get("files")
+        if not isinstance(files, dict) or set(files) != expected_names:
+            _fail("UNSAFE_STATE")
+        for name, encoded in files.items():
+            if not isinstance(encoded, str):
+                _fail("UNSAFE_STATE")
+            try:
+                expected = base64.b64decode(encoded, validate=True)
+            except (ValueError, base64.binascii.Error):
+                _fail("UNSAFE_STATE")
+            try:
+                observed = self._container_file(pending["container_id"], name)
+            except ProvisionError:
+                _fail("AWG_RUNTIME_UNVERIFIED")
+            if observed != expected:
+                _fail("AWG_RUNTIME_UNVERIFIED")
         self._command("docker", "update", "--restart", "unless-stopped",
                       pending["container_id"], limit=128)
         _, policy = self._command("docker", "container", "inspect", "--format",
@@ -512,6 +559,28 @@ class Provisioner:
                 "image_id": pending["image_id"], "listen_port": pending["port"],
                 "subnet": pending["subnet"], "route_mode": pending["route_mode"],
                 "recovery_required": False}
+
+    def _stop_unverified(self, pending: dict) -> None:
+        # The pending journal and exact Docker ID survive a failed health
+        # check. Stop only the container we created; recover will inspect its
+        # layer and remove it if nothing else changed.
+        observed = self._container()
+        if (not observed or observed["id"] != pending["container_id"] or
+                observed["image_id"] != pending["image_id"] or
+                observed["nonce"] != pending["nonce"] or
+                observed["image_ref"] not in (PINNED_AWG_IMAGE,
+                                              "docker.io/" + PINNED_AWG_IMAGE)):
+            _fail("CONTAINER_IDENTITY_INVALID")
+        if observed["running"]:
+            self._command("docker", "update", "--restart", "no",
+                          pending["container_id"], limit=128)
+            self._command("docker", "stop", "--time", "10",
+                          pending["container_id"], timeout=20, limit=128)
+            stopped = self._container()
+            if (not stopped or stopped["id"] != observed["id"] or
+                    stopped["image_id"] != observed["image_id"] or
+                    stopped["nonce"] != observed["nonce"] or stopped["running"]):
+                _fail("MANUAL_RECOVERY_REQUIRED")
 
     def apply(self, port: int, subnet: str, expected_state: str, *, confirm: bool,
               route: str = "full") -> dict:
@@ -582,15 +651,18 @@ class Provisioner:
                     if str(exc) != "AWG_RUNTIME_UNVERIFIED":
                         raise
                     time.sleep(0.25)
+            self._stop_unverified(pending)
             _fail("AWG_RUNTIME_UNVERIFIED")
 
     def recover(self) -> dict:
         with self._source_guard(), self._locked():
             pending = _read_state(self.state_root / "pending.json", self.owner)
             if pending is None:
+                state = _read_state(self.state_root / "state.json", self.owner)
+                if state is not None and not self._installed_matches(state, self._container()):
+                    _fail("INSTALLATION_DRIFT")
                 return {"schema_version": SCHEMA_VERSION, "action": "recovered",
-                        "changed": False, "installed": _read_state(
-                            self.state_root / "state.json", self.owner) is not None}
+                        "changed": False, "installed": state is not None}
             if (pending.get("image_ref") != PINNED_AWG_IMAGE or
                     not IMAGE_ID.fullmatch(str(pending.get("image_id", ""))) or
                     not re.fullmatch(r"[0-9a-f]{32}", str(pending.get("nonce", ""))) or
