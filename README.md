@@ -117,10 +117,9 @@ Workflow `Disposable AWG full route` запускается только вру�
 `workflow_dispatch` на одноразовом GitHub-hosted Ubuntu 24.04 x86_64.
 Он проверяет `/dev/net/tun`, устанавливает закреплённый образ AmneziaWG,
 запускает `awg0`, IPv4 forwarding и правила NAT/FORWARD. Затем создаёт
-временный AWG-клиент и HTTP listener на закрытом адресе Docker bridge,
-выдаёт через admin
-запечатанный профиль с `0.0.0.0/0, ::/0`, проверяет handshake и IPv4 HTTP
-ответ через туннель. Только маршрут до этого endpoint направляется через
+временный AWG-клиент и HTTP listener на закрытом адресе Docker bridge. Через
+admin выдаёт запечатанный профиль с `0.0.0.0/0, ::/0`, проверяет handshake
+и IPv4 HTTP-ответ через туннель. Только маршрут до этого endpoint направляется через
 `awg0` в тестовом клиенте; трафик за пределы Docker bridge не посылается.
 Тест использует лишь сгенерированные ключи, временное состояние и адреса
 Docker bridge, закрывает listener и удаляет свои контейнеры по точным ID,
@@ -132,8 +131,10 @@ python3 -m lab.amnezia_provision_docker \
   --i-understand-this-runs-disposable-docker --route full --verify-client-traffic
 ```
 
-Подключение с настоящего телефона и IPv6-маршрутизация этим сценарием не
-проверяются; результат ручного workflow следует оценить до выпуска.
+[Ручной прогон на одноразовой Ubuntu 24.04](https://github.com/sovagrid/sovagrid-vpn/actions/runs/41190306888)
+завершился успешно: профиль, handshake, IPv4 forwarding, NAT и HTTP через AWG
+проверены. Подключение с настоящего телефона, IPv6-маршрутизация и внешний
+Интернет этим сценарием не проверяются.
 
 ## Что видит адаптер
 
