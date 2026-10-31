@@ -8,18 +8,23 @@ UDP port are used briefly, then the owned test container is removed. It does
 not inspect or remove any pre-existing container.
 
 With --verify-client-traffic, a sealed full-route client profile is exercised
-against a second disposable client and an HTTP endpoint on Docker's bridge.
-The endpoint's /32 route is forced through awg0 to verify forwarding and NAT.
+against a disposable client and a host HTTP listener bound only to Docker's
+private bridge gateway. Its /32 route is forced through awg0 to verify
+forwarding and NAT.
 """
 
 from __future__ import annotations
 
 import argparse
 import base64
+from contextlib import contextmanager
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import ipaddress
+import json
 from pathlib import Path
 import subprocess
 from tempfile import TemporaryDirectory
+import threading
 import time
 import uuid
 
@@ -56,23 +61,17 @@ def _docker_ip(container: str) -> str:
 
 
 def _start_fixture_container(name: str, nonce: str,
-                             containers: list[tuple[str, str]], *, client: bool) -> None:
+                             containers: list[tuple[str, str]]) -> None:
     command = ["run", "-d", "--pull", "never", "--network", "bridge",
                "--read-only", "--pids-limit", "64", "--memory", "128m",
                "--security-opt", "no-new-privileges", "--tmpfs",
                "/tmp:rw,nosuid,nodev,size=4m", "--tmpfs",
                "/run:rw,nosuid,nodev,size=1m", "--label",
-               f"io.sovagrid.disposable-amnezia-fixture={nonce}", "--name", name]
-    if client:
-        command += ["--device", "/dev/net/tun", "--cap-drop", "ALL",
-                    "--cap-add", "NET_ADMIN", "--entrypoint", "/bin/sh",
-                    PINNED_AWG_IMAGE, "-c", "amneziawg-go awg0 >/tmp/go.log 2>&1 & "
-                    "while :; do sleep 60; done"]
-    else:
-        command += ["--cap-drop", "ALL", "--entrypoint", "/bin/sh",
-                    PINNED_AWG_IMAGE, "-c", "mkdir -p /tmp/www; "
-                    f"printf '%s' '{nonce}' > /tmp/www/index.html; "
-                    "exec busybox httpd -f -p 18080 -h /tmp/www"]
+               f"io.sovagrid.disposable-amnezia-fixture={nonce}", "--name", name,
+               "--device", "/dev/net/tun", "--cap-drop", "ALL",
+               "--cap-add", "NET_ADMIN", "--entrypoint", "/bin/sh",
+               PINNED_AWG_IMAGE, "-c", "amneziawg-go awg0 >/tmp/go.log 2>&1 & "
+               "while :; do sleep 60; done"]
     # Register the unique name before docker run: a timeout after creation
     # must still let finally locate and remove our labelled container.
     containers.append((name, nonce))
@@ -91,16 +90,82 @@ def _wait_awg(container: str) -> None:
     raise RuntimeError("disposable AWG client interface did not start")
 
 
-def _wait_endpoint(server_id: str, endpoint_ip: str, expected: bytes) -> None:
-    for _ in range(20):
-        result = subprocess.run(
-            ("docker", "exec", server_id, "busybox", "wget", "-q", "-T", "2",
-             "-O", "-", f"http://{endpoint_ip}:18080/"),
-            capture_output=True, check=False, timeout=4)
-        if result.returncode == 0 and result.stdout == expected:
-            return
-        time.sleep(0.25)
-    raise RuntimeError("disposable HTTP endpoint did not start")
+def _bridge_gateway() -> str:
+    try:
+        networks = json.loads(_run("network", "inspect", "bridge"))
+        if (not isinstance(networks, list) or len(networks) != 1 or
+                networks[0].get("Name") != "bridge" or
+                networks[0].get("Driver") != "bridge"):
+            raise ValueError
+        configs = networks[0]["IPAM"]["Config"]
+        gateways = []
+        for config in configs:
+            try:
+                gateway = ipaddress.IPv4Address(config["Gateway"])
+                subnet = ipaddress.IPv4Network(config["Subnet"], strict=True)
+            except (ValueError, TypeError, KeyError):
+                continue  # IPv6 or an incomplete non-IPv4 record.
+            if (gateway in subnet and subnet.is_private and
+                    not gateway.is_unspecified and not gateway.is_loopback):
+                gateways.append(str(gateway))
+        if len(gateways) != 1:
+            raise ValueError
+        return gateways[0]
+    except (ValueError, TypeError, KeyError, AttributeError) as exc:
+        raise RuntimeError("disposable Docker bridge gateway is unavailable") from exc
+
+
+@contextmanager
+def _bridge_endpoint(token: bytes):
+    gateway = _bridge_gateway()
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            if self.path != "/":
+                self.send_error(404)
+                return
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain")
+            self.send_header("Content-Length", str(len(token)))
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.wfile.write(token)
+
+        def log_message(self, _format, *_args):
+            pass  # Do not place bridge addresses or request data in public CI logs.
+
+    # The bridge gateway is a private interface on this disposable runner.
+    # Binding its exact address never opens a public or wildcard listener.
+    server = ThreadingHTTPServer((gateway, 0), Handler)
+    thread = threading.Thread(target=server.serve_forever,
+                              kwargs={"poll_interval": 0.1}, daemon=True)
+    started = False
+    try:
+        thread.start()
+        started = True
+        yield gateway, server.server_port
+    finally:
+        if started:
+            server.shutdown()
+        server.server_close()
+        if started:
+            thread.join(timeout=3)
+            if thread.is_alive():
+                raise RuntimeError("disposable HTTP endpoint did not stop")
+
+
+def _http_from(container: str, endpoint_ip: str, endpoint_port: int) -> bytes:
+    # Only a validated bridge IP and kernel-assigned port enter this fixed
+    # request. No client profile or private key is included in argv.
+    script = (f"set -e; exec 3<>/dev/tcp/{endpoint_ip}/{endpoint_port}; "
+              "printf 'GET / HTTP/1.0\\r\\nHost: fixture\\r\\nConnection: close\\r\\n\\r\\n' >&3; "
+              "cat <&3")
+    raw = _run("exec", container, "bash", "-c", script, timeout=20)
+    status, separator, rest = raw.partition(b"\r\n")
+    _headers, body_separator, body = rest.partition(b"\r\n\r\n")
+    if status != b"HTTP/1.0 200 OK" or not separator or not body_separator:
+        raise RuntimeError("disposable HTTP endpoint returned an invalid reply")
+    return body
 
 
 def _verify_full_route(provisioner: Provisioner,
@@ -120,43 +185,41 @@ def _verify_full_route(provisioner: Provisioner,
 
     nonce = uuid.uuid4().hex
     client = "sg-awg-provision-client-" + nonce[:12]
-    endpoint = "sg-awg-provision-endpoint-" + nonce[:12]
-    _start_fixture_container(client, nonce, containers, client=True)
-    _start_fixture_container(endpoint, nonce, containers, client=False)
+    _start_fixture_container(client, nonce, containers)
     _wait_awg(client)
     server_ip = _docker_ip(server_id)
-    endpoint_ip = _docker_ip(endpoint)
-    _wait_endpoint(server_id, endpoint_ip, nonce.encode("ascii"))
-    admin = provisioner.admin_factory()
-    preview = admin.enroll_preview()
-    admin.enroll(preview["container_id"], confirm_image_id=preview["image_id"],
-                 confirm_config_sha256=preview["config_sha256"],
-                 confirm_table_sha256=preview["table_sha256"])
-    recipient = ec.generate_private_key(ec.SECP256R1())
-    public = recipient.public_key().public_bytes(
-        serialization.Encoding.X962, serialization.PublicFormat.UncompressedPoint)
-    public_b64 = base64.urlsafe_b64encode(public).rstrip(b"=").decode("ascii")
-    created = admin.create_profile("ci-client", "10.44.0.2", server_ip,
-                                   public_b64, route="full")
-    if created["profile_format"] != "awg3-conf":
-        raise RuntimeError("disposable AWG client profile format differs")
-    profile = decrypt(created["sealed_profile"], recipient, "awg2", "ci-client")
-    if b"AllowedIPs = 0.0.0.0/0, ::/0" not in profile:
-        raise RuntimeError("disposable AWG profile is not full route")
-    # The profile travels only through stdin; no key material enters argv or logs.
-    _run("exec", client, "sh", "-c", "umask 077; cat > /tmp/client.conf",
-         input=profile)
-    _run("exec", client, "bash", "-c",
-         "set -e; awg setconf awg0 <(awg-quick strip /tmp/client.conf); "
-         "ip addr add 10.44.0.2/24 dev awg0; ip link set awg0 up")
-    _run("exec", client, "ip", "route", "add", endpoint_ip + "/32", "dev", "awg0")
-    route = _run("exec", client, "ip", "route", "get", endpoint_ip).decode("ascii")
-    if "dev awg0" not in route:
-        raise RuntimeError("disposable endpoint route bypasses AWG")
-    response = _run("exec", client, "busybox", "wget", "-q", "-T", "12",
-                    "-O", "-", f"http://{endpoint_ip}:18080/", timeout=20)
-    if response != nonce.encode("ascii"):
-        raise RuntimeError("disposable endpoint response differs")
+    with _bridge_endpoint(nonce.encode("ascii")) as (endpoint_ip, endpoint_port):
+        if _http_from(server_id, endpoint_ip, endpoint_port) != nonce.encode("ascii"):
+            raise RuntimeError("disposable HTTP endpoint was not reachable from AWG server")
+        admin = provisioner.admin_factory()
+        preview = admin.enroll_preview()
+        admin.enroll(preview["container_id"], confirm_image_id=preview["image_id"],
+                     confirm_config_sha256=preview["config_sha256"],
+                     confirm_table_sha256=preview["table_sha256"])
+        recipient = ec.generate_private_key(ec.SECP256R1())
+        public = recipient.public_key().public_bytes(
+            serialization.Encoding.X962, serialization.PublicFormat.UncompressedPoint)
+        public_b64 = base64.urlsafe_b64encode(public).rstrip(b"=").decode("ascii")
+        created = admin.create_profile("ci-client", "10.44.0.2", server_ip,
+                                       public_b64, route="full")
+        if created["profile_format"] != "awg3-conf":
+            raise RuntimeError("disposable AWG client profile format differs")
+        profile = decrypt(created["sealed_profile"], recipient, "awg2", "ci-client")
+        if b"AllowedIPs = 0.0.0.0/0, ::/0" not in profile:
+            raise RuntimeError("disposable AWG profile is not full route")
+        # The profile travels only through stdin; no key material enters argv or logs.
+        _run("exec", client, "sh", "-c", "umask 077; cat > /tmp/client.conf",
+             input=profile)
+        _run("exec", client, "bash", "-c",
+             "set -e; awg setconf awg0 <(awg-quick strip /tmp/client.conf); "
+             "ip addr add 10.44.0.2/24 dev awg0; ip link set awg0 up")
+        _run("exec", client, "ip", "route", "add", endpoint_ip + "/32", "dev", "awg0")
+        route = _run("exec", client, "ip", "route", "get", endpoint_ip).decode("ascii")
+        if "dev awg0" not in route:
+            raise RuntimeError("disposable endpoint route bypasses AWG")
+        response = _http_from(client, endpoint_ip, endpoint_port)
+        if response != nonce.encode("ascii"):
+            raise RuntimeError("disposable endpoint response differs")
     handshakes = _run("exec", server_id, "awg", "show", "awg0",
                       "latest-handshakes").decode("ascii").splitlines()
     if len(handshakes) != 1 or len(handshakes[0].split()) != 2 or not (
