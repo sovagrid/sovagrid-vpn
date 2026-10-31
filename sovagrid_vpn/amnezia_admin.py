@@ -33,6 +33,7 @@ from typing import Callable, Iterator
 
 
 STATE_ROOT = Path("/var/lib/sovagrid-vpn/amnezia-admin")
+PROVISION_STATE = Path("/var/lib/sovagrid-vpn/amnezia-provision/state.json")
 MAX_OWNED_CLIENTS = 128  # Agent and Hub status contracts expose at most 128 names.
 MAX_CONFIG = 65536
 MAX_DUMP = 262144
@@ -41,6 +42,12 @@ KEY_PATTERN = re.compile(r"[A-Za-z0-9+/]{43}=\Z")
 NAME_PATTERN = re.compile(r"[a-z][a-z0-9_-]{0,31}\Z")
 HEX_ID = re.compile(r"[0-9a-f]{64}\Z")
 IMAGE_ID = re.compile(r"sha256:[0-9a-f]{64}\Z")
+# Docker Hub manifest digest for the official amd64 AmneziaWG 3.1 userspace
+# image. The SovaGrid provisioner assembles the fixed server layout in a
+# container created from this immutable base; Docker may retain either form
+# of the fully qualified reference in Config.Image.
+PINNED_AWG_IMAGE = ("amneziavpn/amneziawg-go@sha256:"
+                    "cbafc02b8373a83f428272db6d8001b37bc02e6211cbd8c0cb4e2e3759b12b72")
 AWG_PREVIEW_NUMBERS = frozenset(("Jc", "Jmin", "Jmax", "S1", "S2", "S3", "S4"))
 AWG_PREVIEW_RANGES = frozenset(("H1", "H2", "H3", "H4"))
 AWG_PREVIEW_REQUIRED = AWG_PREVIEW_NUMBERS | AWG_PREVIEW_RANGES
@@ -521,8 +528,10 @@ class AmneziaAdmin:
         fields = raw.decode("ascii", "strict").strip().split()
         if (len(fields) != 5 or not HEX_ID.fullmatch(fields[0]) or
                 not IMAGE_ID.fullmatch(fields[1]) or
-                fields[2] not in (self.target.image_name,
-                                  self.target.image_name.removesuffix(":latest")) or
+                fields[2] not in ((self.target.image_name,
+                                   self.target.image_name.removesuffix(":latest")) +
+                                  ((PINNED_AWG_IMAGE, "docker.io/" + PINNED_AWG_IMAGE)
+                                   if self.target.binary == "awg" else ())) or
                 fields[3] != "/" + self.target.container or fields[4] != "true"):
             _error("Amnezia container identity or running state differs")
         mounts_raw = self._run(("docker", "container", "inspect", "--format",
@@ -1053,6 +1062,22 @@ class AmneziaAdmin:
         return self._add(name, public_key, address,
                          generated=(private_key, endpoint_host, route, recipient_public_key))
 
+    def _check_provision_route(self, state: dict, route: str) -> None:
+        if self.target.name != "awg2" or route != "full":
+            return
+        if not PROVISION_STATE.exists() and not PROVISION_STATE.is_symlink():
+            return
+        _private_dir(PROVISION_STATE.parent, owner=self._owner)
+        try:
+            provision = json.loads(_read_private(PROVISION_STATE, owner=self._owner),
+                                   object_pairs_hook=_unique_pairs)
+        except (ValueError, UnicodeError):
+            _error("Amnezia provision state invalid")
+        if (not isinstance(provision, dict) or provision.get("route_mode") != "full" or
+                provision.get("container_id") != state.get("container_id") or
+                provision.get("image_id") != state.get("image_id")):
+            _error("Full Amnezia route is not enabled for this container")
+
     def _add(self, name: str, public_key: str, address: str,
              generated: tuple[str, str, str, str] | None = None) -> dict:
         _client_name(name)
@@ -1064,6 +1089,8 @@ class AmneziaAdmin:
         with self._locked():
             self._require_no_pending()
             state, state_raw = self._load_state()
+            if generated is not None:
+                self._check_provision_route(state, generated[2])
             if len(state["owned"]) >= MAX_OWNED_CLIENTS:
                 _error("SovaGrid-owned Amnezia client limit reached")
             config_raw, table_raw, config, rows, psk, interface, runtime = self._snapshot()

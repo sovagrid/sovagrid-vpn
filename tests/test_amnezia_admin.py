@@ -19,7 +19,7 @@ from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 
 from sovagrid_vpn.amnezia_admin import (AmneziaAdmin, AmneziaAdminError,
-                                         TARGETS, Target, _awg_header_key,
+                                         PINNED_AWG_IMAGE, TARGETS, Target, _awg_header_key,
                                          _config, _preview_awg_parameters)
 from sovagrid_vpn.amnezia_profile import public_from_private
 from sovagrid_vpn.sealed import INFO
@@ -192,6 +192,13 @@ class AmneziaAdminTests(unittest.TestCase):
         with self.assertRaisesRegex(AmneziaAdminError, "identity changed"):
             self.admin.add("phone", key(3), "10.44.0.3")
         self.assertNotIn(key(3).encode(), self.fake.files[self.target.config_path])
+
+    def test_pinned_official_base_reference_is_accepted_only_for_awg(self):
+        self.fake.image_name = PINNED_AWG_IMAGE
+        self.assertEqual(self.admin._identity(), (CONTAINER_ID, IMAGE_ID))
+        self.fake.image_name = "amneziavpn/amneziawg-go:latest"
+        with self.assertRaisesRegex(AmneziaAdminError, "identity"):
+            self.admin._identity()
 
     def test_enroll_preview_is_secret_free_and_pinned_at_confirmation(self):
         before = dict(self.fake.files)
