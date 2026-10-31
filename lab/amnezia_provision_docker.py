@@ -257,8 +257,12 @@ def main() -> None:
                 identity = provisioner._container()
                 state = _read_state(provisioner.state_root / "state.json", provisioner.owner)
                 pending = _read_state(provisioner.state_root / "pending.json", provisioner.owner)
-                owner_nonce = (state or pending or {}).get("nonce")
-                if identity and identity["nonce"] == owner_nonce:
+                owner_state = state or pending
+                if (identity and owner_state and
+                        identity["nonce"] == owner_state.get("nonce") and
+                        identity["image_id"] == owner_state.get("image_id") and
+                        owner_state.get("image_ref") == PINNED_AWG_IMAGE and
+                        owner_state.get("container_id") in (None, identity["id"])):
                     result = subprocess.run(("docker", "rm", "-f", identity["id"]),
                                             capture_output=True, check=False, timeout=20)
                     cleanup_failed |= result.returncode != 0
