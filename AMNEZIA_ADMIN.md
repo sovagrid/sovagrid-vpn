@@ -158,16 +158,20 @@ preview. Клиенты вне SovaGrid при принятии не измен�
 только зашифрованным. `RECIPIENT_P256_PUBLIC_B64URL` генерируется в браузере
 или приложении как открытая точка P-256; закрытый ключ расшифрования остаётся
 там. `ENDPOINT_HOST` — публичный IP или DNS сервера, порт берётся из текущего
-конфига. Адрес клиента должен быть свободным в серверной подсети:
+конфига. Для `create-profile` вместо ручного адреса можно передать `auto`:
+сервер выберет первый свободный IPv4 из своей подсети под блокировкой
+конфигурации. Адреса сервера, сети, broadcast и всех существующих peer
+исключаются. Если свободного адреса нет, команда откажет без записи. Явный
+адрес по-прежнему доступен:
 
 ```sh
 sudo env PYTHONDONTWRITEBYTECODE=1 python3 -m sovagrid_vpn.amnezia_admin \
-  create-profile awg2 iphone 10.44.0.3 vpn.example.com RECIPIENT_P256_PUBLIC_B64URL
+  create-profile awg2 iphone auto vpn.example.com RECIPIENT_P256_PUBLIC_B64URL
 sudo env PYTHONDONTWRITEBYTECODE=1 python3 -m sovagrid_vpn.amnezia_admin \
   sealed-export awg2 iphone RECIPIENT_P256_PUBLIC_B64URL
 # Для принятого под управление стандартного WireGuard контейнера:
 sudo env PYTHONDONTWRITEBYTECODE=1 python3 -m sovagrid_vpn.amnezia_admin \
-  create-profile wireguard iphone 10.44.0.3 vpn.example.com RECIPIENT_P256_PUBLIC_B64URL
+  create-profile wireguard iphone auto vpn.example.com RECIPIENT_P256_PUBLIC_B64URL
 ```
 
 По умолчанию `--route split`: профиль направляет через туннель только
@@ -314,6 +318,8 @@ settings-apply awg2 OLD_CONFIG_SHA256 GENERATION PROPOSED_CONFIG_SHA256 '{"Jc":"
 `{version:1,ephemeral_public_key,salt,nonce,ciphertext}`. `sealed-export`
 возвращает только такой конверт. Broker проверяет канонический base64url и
 размеры P-256 точки 65 байт, salt 16, nonce 12, ciphertext не более 4096 байт.
+В `add-profile` `ADDRESS` может быть точным литералом `auto`; ручной `add`
+для внешнего ключа по-прежнему требует явный IPv4.
 В `revoke`, `status` и `settings-preview` передаются только перечисленные в
 коде поля. Preview ограничен 4096 байтами и не содержит ключей или списка
 клиентов; Hub допускает его только для администратора выбранного Agent.

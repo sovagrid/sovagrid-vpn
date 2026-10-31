@@ -104,7 +104,8 @@ def parse_action(argv: Any) -> tuple[str, tuple[Any, ...]]:
         _client(client)
         _recipient(recipient)
         # The root manager validates IPv4, endpoint and P-256 on-curve before writes.
-        if not address.isascii() or len(address) > 15 or not re.fullmatch(r"[0-9.]+", address):
+        if not address.isascii() or len(address) > 15 or not (
+                address == "auto" or re.fullmatch(r"[0-9.]+", address)):
             raise AmneziaControlError("Invalid client IPv4 address")
         if not endpoint_host.isascii() or len(endpoint_host) > 253:
             raise AmneziaControlError("Invalid endpoint host")

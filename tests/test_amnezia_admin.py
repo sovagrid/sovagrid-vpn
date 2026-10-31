@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import base64
+from concurrent.futures import ThreadPoolExecutor
 import json
 from pathlib import Path
 import subprocess
@@ -818,6 +819,55 @@ class AmneziaAdminTests(unittest.TestCase):
         self.assertEqual(self.admin.revoke("phone")["action"], "revoked")
         with self.assertRaisesRegex(AmneziaAdminError, "no SovaGrid AWG3 profile"):
             self.admin.sealed_export("phone", recipient)
+
+    def test_auto_profile_address_skips_external_peer_and_seals_selected_address(self):
+        config = self.fake.files[self.target.config_path]
+        self.fake.files[self.target.config_path] = config.replace(
+            b"ListenPort = 49289\n\n", b"ListenPort = 49289\n" + AWG3_FIELDS.encode() + b"\n")
+        self.fake.runtime_config = self.fake.files[self.target.config_path]
+        self.enroll()
+        private, recipient = recipient_key()
+        result = self.admin.create_profile("phone", "auto", "vpn.example.com", recipient)
+        state, _ = self.admin._load_state()
+        self.assertEqual(state["owned"]["phone"]["address"], "10.44.0.3")
+        profile = decrypt_sealed(result["sealed_profile"], private, self.target.name, "phone")
+        self.assertIn(b"Address = 10.44.0.3/32", profile)
+        self.assertNotIn(b"10.44.0.2/32", profile)
+        self.assertNotIn("private_key", result)
+        self.assertNotIn("10.44.0.3", json.dumps(result))
+        with self.assertRaisesRegex(AmneziaAdminError, "Invalid client IPv4 address"):
+            self.admin.add("other", key(4), "auto")
+
+    def test_auto_address_has_no_capacity_in_small_subnet_and_does_not_write(self):
+        config = self.fake.files[self.target.config_path]
+        self.fake.files[self.target.config_path] = config.replace(
+            b"Address = 10.44.0.1/24", b"Address = 10.44.0.1/30").replace(
+            b"ListenPort = 49289\n\n", b"ListenPort = 49289\n" + AWG3_FIELDS.encode() + b"\n")
+        self.fake.runtime_config = self.fake.files[self.target.config_path]
+        self.enroll()
+        _, recipient = recipient_key()
+        before = dict(self.fake.files)
+        with self.assertRaisesRegex(AmneziaAdminError, "No free client IPv4 address"):
+            self.admin.create_profile("phone", "auto", "vpn.example.com", recipient)
+        self.assertEqual(self.fake.files, before)
+        self.assertEqual(self.admin.status()["owned_clients"], [])
+
+    def test_concurrent_auto_profiles_choose_distinct_addresses(self):
+        config = self.fake.files[self.target.config_path]
+        self.fake.files[self.target.config_path] = config.replace(
+            b"ListenPort = 49289\n\n", b"ListenPort = 49289\n" + AWG3_FIELDS.encode() + b"\n")
+        self.fake.runtime_config = self.fake.files[self.target.config_path]
+        self.enroll()
+        _, recipient = recipient_key()
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            futures = [pool.submit(self.admin.create_profile, name, "auto",
+                                   "vpn.example.com", recipient)
+                       for name in ("phone", "tablet")]
+            for future in futures:
+                self.assertEqual(future.result(timeout=15)["action"], "added")
+        state, _ = self.admin._load_state()
+        self.assertEqual({entry["address"] for entry in state["owned"].values()},
+                         {"10.44.0.3", "10.44.0.4"})
 
     def test_awg3_profile_rejects_missing_parameters_before_write(self):
         self.enroll()

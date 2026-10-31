@@ -1046,7 +1046,11 @@ class AmneziaAdmin:
 
     def create_profile(self, name: str, address: str, endpoint_host: str,
                        recipient_public_key: str, *, route: str = "split") -> dict:
-        """Generate a target-specific client key and return only sealed .conf."""
+        """Generate a target-specific client key and return only sealed .conf.
+
+        The literal ``auto`` picks a free address under the same root lock as
+        the config/runtime snapshot and peer transaction.
+        """
         _client_name(name)
         try:
             from .amnezia_profile import endpoint, new_client_keypair
@@ -1082,10 +1086,12 @@ class AmneziaAdmin:
              generated: tuple[str, str, str, str] | None = None) -> dict:
         _client_name(name)
         public_key = _key(public_key)
-        try:
-            client_ip = ipaddress.IPv4Address(address)
-        except (ValueError, TypeError):
-            _error("Invalid client IPv4 address")
+        client_ip = None
+        if address != "auto" or generated is None:
+            try:
+                client_ip = ipaddress.IPv4Address(address)
+            except (ValueError, TypeError):
+                _error("Invalid client IPv4 address")
         with self._locked():
             self._require_no_pending()
             state, state_raw = self._load_state()
@@ -1095,6 +1101,21 @@ class AmneziaAdmin:
                 _error("SovaGrid-owned Amnezia client limit reached")
             config_raw, table_raw, config, rows, psk, interface, runtime = self._snapshot()
             self._check_state(state, config_raw, table_raw, config)
+            if client_ip is None:
+                # _snapshot verifies that config, registry and runtime describe
+                # exactly the same peers; _check_state also validates owned peers.
+                # The first len(used)+1 interior addresses contain a free one
+                # whenever the subnet has capacity, even for a huge CIDR.
+                used = {config.server_address} | {peer.address for peer in config.peers}
+                first = int(config.network.network_address) + 1
+                interior = max(0, config.network.num_addresses - 2)
+                for offset in range(min(interior, len(used) + 1)):
+                    candidate = ipaddress.IPv4Address(first + offset)
+                    if candidate not in used:
+                        client_ip = candidate
+                        break
+                if client_ip is None:
+                    _error("No free client IPv4 address")
             if (name in state["owned"] or public_key in runtime or
                     client_ip not in config.network or
                     client_ip in (config.server_address, config.network.network_address,

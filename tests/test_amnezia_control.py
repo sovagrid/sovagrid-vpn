@@ -172,6 +172,7 @@ class BrokerTests(unittest.TestCase):
     def test_exact_grammar_and_no_administrative_actions(self):
         valid = [
             ["add-profile", "awg2", "phone", "10.44.0.3", "vpn.example.com", RECIPIENT],
+            ["add-profile", "awg2", "phone", "auto", "vpn.example.com", RECIPIENT],
             ["add-profile", "awg2", "phone", "10.44.0.3", "198.51.100.7", RECIPIENT,
              "--route", "full"],
             ["sealed-export", "awg2", "phone", RECIPIENT],
@@ -196,6 +197,7 @@ class BrokerTests(unittest.TestCase):
             ["revoke", "awg2", "phone", "extra"],
             ["add-profile", "awg2", "phone", "10.44.0.3", "host", RECIPIENT,
              "--route", "bad"],
+            ["add-profile", "awg2", "phone", "AUTO", "host", RECIPIENT],
             ["status", "awg2", "--docker", "/var/run/docker.sock"],
             ["settings-preview", "awg2", "--docker"],
             ["settings-plan", "wireguard", "c" * 64, "0", '{"Jc":"5"}'],
