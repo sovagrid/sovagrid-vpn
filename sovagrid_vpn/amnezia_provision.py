@@ -32,6 +32,7 @@ import time
 from typing import Callable
 
 from .amnezia_admin import AmneziaAdmin, AmneziaAdminError, PINNED_AWG_IMAGE, TARGETS
+from .amnezia_install import InstallError, Installer as AmneziaInstaller
 
 
 ROOT = Path("/var/lib/sovagrid-vpn/amnezia-provision")
@@ -39,6 +40,7 @@ CONTAINER = "amnezia-awg2"
 LABEL = "io.sovagrid.amnezia-provision"
 SCHEMA_VERSION = 1
 MAX_STATE = 65536
+MAX_SOURCE = 1048576
 HEX = re.compile(r"[0-9a-f]{64}\Z")
 IMAGE_ID = re.compile(r"sha256:[0-9a-f]{64}\Z")
 
@@ -289,6 +291,49 @@ class Provisioner:
             _fail("ROOT_REQUIRED")
 
     @contextmanager
+    def _source_guard(self):
+        try:
+            with AmneziaInstaller()._source_guard():
+                yield
+        except InstallError as exc:
+            _fail("SOURCE_BUSY" if "busy" in str(exc).lower() else "SOURCE_UNTRUSTED")
+
+    def _source_revision(self) -> str:
+        source_root = Path(__file__).absolute().parent.parent
+        if self.require_root and source_root != Path("/opt/sovagrid-src/sovagrid-vpn"):
+            _fail("SOURCE_UNTRUSTED")
+        paths = (source_root / "sovagrid_vpn" / "amnezia_provision.py",
+                 source_root / "sovagrid_vpn" / "amnezia_admin.py",
+                 source_root / "deploy" / "sovagrid-amnezia-provision")
+        directories = ((Path("/opt"), Path("/opt/sovagrid-src"))
+                       if self.require_root else ())
+        for directory in (*directories, source_root, source_root / "sovagrid_vpn",
+                          source_root / "deploy"):
+            _secure_dir(directory, self.owner, private=False)
+        digest = hashlib.sha256()
+        for path in paths:
+            try:
+                fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+                try:
+                    info = os.fstat(fd)
+                    if (not stat.S_ISREG(info.st_mode) or info.st_uid != self.owner or
+                            info.st_nlink != 1 or info.st_mode & 0o022 or
+                            info.st_size > MAX_SOURCE):
+                        _fail("SOURCE_UNTRUSTED")
+                    raw = os.read(fd, MAX_SOURCE + 1)
+                finally:
+                    os.close(fd)
+            except OSError:
+                _fail("SOURCE_UNTRUSTED")
+            if len(raw) > MAX_SOURCE:
+                _fail("SOURCE_UNTRUSTED")
+            digest.update(str(path.relative_to(source_root)).encode("ascii"))
+            digest.update(b"\0")
+            digest.update(raw)
+            digest.update(b"\0")
+        return digest.hexdigest()
+
+    @contextmanager
     def _locked(self):
         self._root()
         _secure_dir(self.state_root.parent, self.owner, create=True, private=False)
@@ -397,7 +442,7 @@ class Provisioner:
                          "image_id": image_id, "container_id": container["id"] if container else None,
                          "state": bool(state), "pending": bool(pending),
                          "platform": platform, "port": port, "subnet": str(network),
-                         "route_mode": route}
+                         "route_mode": route, "source_sha256": self._source_revision()}
         revision = hashlib.sha256(json.dumps(revision_body, sort_keys=True,
                                               separators=(",", ":")).encode()).hexdigest()
         result = {"schema_version": SCHEMA_VERSION, "action": "preview", "writes": False,
@@ -412,7 +457,8 @@ class Provisioner:
 
     def preview(self, port: int, subnet: str, route: str = "full") -> dict:
         try:
-            return self._observe(port, subnet, route)
+            with self._source_guard():
+                return self._observe(port, subnet, route)
         except ProvisionError as exc:
             return {"schema_version": SCHEMA_VERSION, "action": "preview", "writes": False,
                     "target": "awg2", "container": CONTAINER,
@@ -473,7 +519,7 @@ class Provisioner:
             _fail("CONFIRMATION_REQUIRED")
         if not isinstance(expected_state, str) or not HEX.fullmatch(expected_state):
             _fail("INVALID_REVISION")
-        with self._locked():
+        with self._source_guard(), self._locked():
             preview = self._observe(port, subnet, route)
             if "state_revision" not in preview:
                 _fail(preview["reason"])
@@ -539,7 +585,7 @@ class Provisioner:
             _fail("AWG_RUNTIME_UNVERIFIED")
 
     def recover(self) -> dict:
-        with self._locked():
+        with self._source_guard(), self._locked():
             pending = _read_state(self.state_root / "pending.json", self.owner)
             if pending is None:
                 return {"schema_version": SCHEMA_VERSION, "action": "recovered",

@@ -101,6 +101,30 @@ class ProvisionTests(unittest.TestCase):
             self.provisioner.apply(49311, "10.44.0.0/24", "0" * 64, confirm=True)
         self.assertFalse(any(call[1] in ("pull", "create", "start") for call in self.fake.calls))
 
+    def test_source_change_invalidates_preview_before_docker_mutation(self):
+        preview = self.provisioner.preview(49311, "10.44.0.0/24")
+        with patch.object(self.provisioner, "_source_revision", return_value="f" * 64):
+            with self.assertRaisesRegex(ProvisionError, "PREVIEW_STALE"):
+                self.provisioner.apply(49311, "10.44.0.0/24",
+                                       preview["state_revision"], confirm=True)
+        self.assertFalse(any(call[1] in ("pull", "create", "start") for call in self.fake.calls))
+
+    def test_preview_rejects_writable_source(self):
+        source = Path(self.temp.name) / "source"
+        package = source / "sovagrid_vpn"
+        package.mkdir(parents=True)
+        deploy = source / "deploy"
+        deploy.mkdir()
+        for path in (package / "amnezia_provision.py", package / "amnezia_admin.py",
+                     deploy / "sovagrid-amnezia-provision"):
+            path.write_text("safe source\n", encoding="ascii")
+        (package / "amnezia_admin.py").chmod(0o666)
+        with patch("sovagrid_vpn.amnezia_provision.__file__",
+                   str(package / "amnezia_provision.py")):
+            preview = self.provisioner.preview(49311, "10.44.0.0/24")
+        self.assertEqual(preview["reason"], "SOURCE_UNTRUSTED")
+        self.assertFalse(preview["can_apply"])
+
     def test_existing_container_refuses_without_mutation(self):
         self.fake.container = ("a" * 64 + " sha256:" + "b" * 64 + " " + PINNED_AWG_IMAGE +
                                " unrelated true\n").encode()
