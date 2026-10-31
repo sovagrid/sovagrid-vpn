@@ -45,7 +45,8 @@ def _run(*args: str, input: bytes | None = None, timeout: int = 25) -> bytes:
 
 
 def _docker_ip(container: str) -> str:
-    value = _run("inspect", "--format", "{{.NetworkSettings.IPAddress}}",
+    value = _run("inspect", "--format",
+                 '{{with index .NetworkSettings.Networks "bridge"}}{{.IPAddress}}{{end}}',
                  container).decode("ascii").strip()
     try:
         ipaddress.IPv4Address(value)
