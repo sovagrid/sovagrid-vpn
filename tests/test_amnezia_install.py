@@ -14,7 +14,8 @@ from unittest.mock import patch
 
 from sovagrid_vpn.amnezia_install import (CONFIRM, CONFIRM_SETTINGS,
                                          CONFIRM_WIREGUARD, FILES,
-                                         InstallError, Installer, Layout)
+                                         InstallError, Installer, Layout,
+                                         SOURCE_LOCK)
 
 
 CONTAINER_ID = "a" * 64
@@ -129,6 +130,17 @@ class InstallerTests(unittest.TestCase):
         self.assertEqual(self.installer.install()["action"], "installed")
         self.assertNotIn(("/usr/bin/systemctl", "enable", "--now", "sovagrid-amnezia-control.socket"),
                          self.systemd.commands)
+
+    def test_managed_remote_source_requires_safe_shared_lock(self):
+        lock = self.root / SOURCE_LOCK.lstrip("/")
+        lock.parent.mkdir(parents=True, mode=0o700)
+        self.assertFalse(self.installer.preview()["installer_ready"])
+        self.assertIn("lock unavailable", self.installer.preview()["reason"])
+        with self.assertRaisesRegex(InstallError, "lock unavailable"):
+            self.installer.install()
+        lock.write_bytes(b"")
+        lock.chmod(0o600)
+        self.assertTrue(self.installer.preview()["installer_ready"])
 
     def test_arm_requires_exact_confirmation_and_ready_enrolled_target(self):
         self.installer.install()

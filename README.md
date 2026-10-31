@@ -103,6 +103,33 @@ python3 -m sovagrid_vpn --plan-wireguard demo-vpn --port 51820 --subnet 10.49.0.
 
 ## Управляемый WireGuard: установка и применение
 
+На Ubuntu-хосте, где установлен только Agent, брокер можно подготовить отдельно
+из проверенного пакета VPN, перенесённого SovaGrid. Root-only установщик
+`deploy/install-wireguard-control.py` сначала отдаёт read-only `preview` с
+`state_revision`, затем принимает `apply --expected-state REVISION`. Перед
+записью он повторно сверяет эту ревизию, оба root-owned дерева исходников,
+принадлежность существующих файлов и общий lock пакета. Пакеты
+`wireguard-tools`, `iproute2`, `python3-cryptography` (и `apparmor`, если нужен
+парсер действующего профиля) устанавливаются при отсутствии; для действующего
+профиля `wg-quick` узкий AppArmor-helper добавляет правило чтения собственной
+конфигурации. Только после этого установщик включает ограниченный Unix-сокет
+и брокер. VPN-интерфейс и клиенты не создаются.
+
+```sh
+cd /opt/sovagrid-src/sovagrid-vpn
+sudo python3 -I -B deploy/install-wireguard-control.py preview
+sudo python3 -I -B deploy/install-wireguard-control.py apply --expected-state REVISION_FROM_PREVIEW
+```
+
+При прерывании сохраняется закрытый журнал. `preview` покажет
+`RECOVERY_REQUIRED`; `sudo python3 -I -B deploy/install-wireguard-control.py
+recover` возвращает только собственные файлы и прежнее состояние брокера,
+отказываясь перезаписывать чужие изменения. Для обновления файлов брокера
+предварительно остановите и отключите его socket/service; работающий
+WireGuard-интерфейс это не останавливает. Установленные через apt пакеты и
+успешно добавленное локальное правило AppArmor остаются после отката файлов
+брокера; их удаление может затронуть чужие VPN и выполняется отдельно.
+
 `sudo ./run.sh --with-wireguard` из `sovagrid-blueprint` также ставит
 локальный Unix-сокет `/run/sovagrid-vpn/control.sock` и отдельный root-процесс.
 Основной процесс Agent с системным UID `sovagrid` отправляет проверенный запрос

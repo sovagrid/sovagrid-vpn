@@ -33,6 +33,7 @@ CONFIRM = "I_HAVE_A_MAINTENANCE_WINDOW_FOR_AMNEZIA_AWG2"
 CONFIRM_WIREGUARD = "I_HAVE_A_MAINTENANCE_WINDOW_FOR_AMNEZIA_WIREGUARD"
 CONFIRM_SETTINGS = "I_HAVE_A_MAINTENANCE_WINDOW_FOR_AMNEZIA_AWG3_SETTINGS"
 LOCK_FILE = "/etc/sovagrid-vpn/amnezia-install.lock"
+SOURCE_LOCK = "/var/lib/sovagrid/vpn-source/.lock"
 SYSTEMCTL = "/usr/bin/systemctl"
 SYSTEMD_ANALYZE = "/usr/bin/systemd-analyze"
 SOCKET_UNIT = "sovagrid-amnezia-control.socket"
@@ -123,6 +124,39 @@ class Installer:
         self.run = run
         self.admin_factory = admin_factory
         self.wireguard_admin_factory = wireguard_admin_factory
+
+    @contextmanager
+    def _source_guard(self):
+        """Keep an Agent-only verified VPN source stable while reading it.
+
+        Hub installations made by run.sh predate the remote source lifecycle
+        and have no vpn-source directory. If that directory exists, its lock
+        must be present and safe; an incomplete remote install fails closed.
+        """
+        directory = self.layout.at("/var/lib/sovagrid/vpn-source")
+        if not directory.exists() and not directory.is_symlink():
+            yield
+            return
+        for absolute in ("/var", "/var/lib", "/var/lib/sovagrid",
+                         "/var/lib/sovagrid/vpn-source"):
+            _safe_dir(self.layout.at(absolute), self.owner,
+                      private=absolute.endswith("/vpn-source"))
+        try:
+            fd = os.open(self.layout.at(SOURCE_LOCK), os.O_RDONLY | os.O_NOFOLLOW)
+        except OSError as exc:
+            raise InstallError("Verified VPN source lock unavailable") from exc
+        try:
+            info = os.fstat(fd)
+            if (not stat.S_ISREG(info.st_mode) or info.st_uid != self.owner or
+                    info.st_nlink != 1 or stat.S_IMODE(info.st_mode) != 0o600):
+                raise InstallError("Verified VPN source lock is unsafe")
+            try:
+                fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+            except OSError as exc:
+                raise InstallError("Verified VPN source is busy") from exc
+            yield
+        finally:
+            os.close(fd)
 
     @contextmanager
     def _mutation_lock(self):
@@ -286,6 +320,15 @@ class Installer:
             return {"ready": False, "reason": label + " preflight failed"}
 
     def preview(self, target: str = "awg2") -> dict:
+        try:
+            with self._source_guard():
+                return self._preview(target)
+        except InstallError as exc:
+            return {"schema_version": 1, "action": "preview", "writes": False,
+                    "selected_target": target, "installer_ready": False,
+                    "can_arm": False, "reason": str(exc)}
+
+    def _preview(self, target: str = "awg2") -> dict:
         other = "wireguard" if target == "awg2" else "awg2"
         result = {"schema_version": 1, "action": "preview", "writes": False,
                   "selected_target": target, "marker": self._marker(target),
@@ -326,6 +369,15 @@ class Installer:
         return plan["apply_supported"] is True and plan["apply_blockers"] == []
 
     def preview_settings(self) -> dict:
+        try:
+            with self._source_guard():
+                return self._preview_settings()
+        except InstallError as exc:
+            return {"schema_version": 1, "action": "preview-settings",
+                    "selected_target": "awg2", "can_arm": False,
+                    "reason": str(exc)}
+
+    def _preview_settings(self) -> dict:
         """Read-only capability check for a separate AWG3 settings opt-in."""
         result = {"schema_version": 1, "action": "preview-settings",
                   "selected_target": "awg2", "settings_marker": self._settings_marker(),
@@ -374,7 +426,7 @@ class Installer:
         return result
 
     def install(self) -> dict:
-        with self._mutation_lock():
+        with self._mutation_lock(), self._source_guard():
             return self._install_locked()
 
     def _install_locked(self) -> dict:
@@ -403,7 +455,7 @@ class Installer:
         return self.arm_target("awg2", container_id, confirmation)
 
     def arm_target(self, target: str, container_id: str, confirmation: str) -> dict:
-        with self._mutation_lock():
+        with self._mutation_lock(), self._source_guard():
             return self._arm_target_locked(target, container_id, confirmation)
 
     def _arm_target_locked(self, target: str, container_id: str,
@@ -457,7 +509,7 @@ class Installer:
 
     def arm_settings(self, container_id: str, confirmation: str) -> dict:
         """Separate opt-in for AWG3 numeric mutations; peer arm is insufficient."""
-        with self._mutation_lock():
+        with self._mutation_lock(), self._source_guard():
             if (not HEX_ID.fullmatch(container_id or "") or
                     confirmation != CONFIRM_SETTINGS):
                 raise InstallError("Explicit AWG3 settings maintenance confirmation required")
