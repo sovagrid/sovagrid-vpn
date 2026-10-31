@@ -71,6 +71,8 @@ def collect_managed_instances(*, state_root: Path = STATE_ROOT,
             # but incomplete state is visible as an error, never as active.
             try:
                 validate_name(path.name)
+                if manager._administrative_directory(path):
+                    continue
             except Exception:
                 continue
             if path.is_dir() or path.is_symlink():

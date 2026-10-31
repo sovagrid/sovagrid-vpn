@@ -65,6 +65,34 @@ class ManagedInventoryTests(unittest.TestCase):
         self.assertNotIn("profile", serialized)
         self.assertNotIn("peer", serialized)
 
+    def test_amnezia_admin_directories_do_not_become_phantom_wireguard_instances(self):
+        self.manager.create("phone-vpn", 51821, "10.49.0.0/24", "8.8.8.8")
+        for name in ("amnezia-admin", "amnezia-provision"):
+            directory = self.root / "state" / name
+            directory.mkdir(mode=0o700)
+            lock = directory / ".lock"
+            lock.write_bytes(b""); lock.chmod(0o600)
+            state = directory / "state.json"
+            state.write_text('{"schema_version":1,"container_id":"fixture"}')
+            state.chmod(0o600)
+        self.assertEqual([item["name"] for item in self.collect()["instances"]], ["phone-vpn"])
+        self.assertEqual([item["name"] for item in self.manager.instances()], ["phone-vpn"])
+        # Amnezia's state.json also must not block creation of another WG server.
+        self.manager.create("second-vpn", 51822, "10.50.0.0/24", "8.8.8.8")
+        self.assertEqual(len(self.collect()["instances"]), 2)
+
+    def test_new_reserved_names_refuse_but_valid_legacy_wireguard_state_remains_visible(self):
+        from sovagrid_vpn.managed import ManagedVpnError
+        for name in ("amnezia-admin", "amnezia-provision"):
+            with self.assertRaisesRegex(ManagedVpnError, "reserved"):
+                self.manager.create(name, 51821, "10.49.0.0/24", "8.8.8.8")
+        self.assertFalse((self.root / "state").exists())
+        # Model data produced by the earlier implementation which allowed this name.
+        with patch("sovagrid_vpn.managed.RESERVED_STATE_DIRECTORIES", frozenset()):
+            self.manager.create("amnezia-admin", 51821, "10.49.0.0/24", "8.8.8.8")
+        self.assertEqual(self.collect()["instances"][0]["name"], "amnezia-admin")
+        self.assertEqual(self.manager.instances()[0]["name"], "amnezia-admin")
+
     def test_pending_or_drifted_instance_is_error_without_private_fields(self):
         self.manager.create("phone-vpn", 51821, "10.49.0.0/24", "8.8.8.8")
         journal = self.root / "state" / "phone-vpn" / "transaction.json"

@@ -35,6 +35,7 @@ CLIENT = re.compile(r"[a-z][a-z0-9_-]{0,31}\Z")
 DNS_LABEL = re.compile(r"[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\Z")
 KEY = re.compile(r"[A-Za-z0-9+/]{43}=\Z")
 MAX_STATE_BYTES = 256 * 1024
+RESERVED_STATE_DIRECTORIES = frozenset(("amnezia-admin", "amnezia-provision"))
 
 
 class ManagedVpnError(RuntimeError):
@@ -199,6 +200,24 @@ class ManagedWireGuard:
 
     def _path(self, name: str) -> Path:
         return self.state_root / validate_name(name)
+
+    def _administrative_directory(self, path: Path) -> bool:
+        """Keep Amnezia metadata separate while retaining valid legacy names."""
+        if path.name not in RESERVED_STATE_DIRECTORIES:
+            return False
+        _directory(path, uid=self._uid, private=True)
+        state = path / "state.json"
+        if not state.exists() and not state.is_symlink():
+            return True
+        raw = self._read(state)
+        try:
+            value = json.loads(raw)
+        except (ValueError, UnicodeError):
+            return True
+        # A pre-1.0 WireGuard instance could use one of these names. Keep it
+        # visible and let the normal full state validation handle its health.
+        return not (isinstance(value, dict) and value.get("schema_version") == 1 and
+                    value.get("name") == path.name)
 
     def _read(self, path: Path) -> bytes:
         _regular_private(path, uid=self._uid)
@@ -383,6 +402,8 @@ class ManagedWireGuard:
 
     def create(self, name: str, port: int, subnet: str, endpoint: str) -> dict:
         name = validate_name(name)
+        if name in RESERVED_STATE_DIRECTORIES:
+            raise ManagedVpnError("Instance name is reserved for SovaGrid administrative state")
         endpoint = validate_endpoint(endpoint)
         network = validate_network(subnet)
         if isinstance(port, bool) or not isinstance(port, int) or not 1024 <= port <= 65535:
@@ -393,6 +414,8 @@ class ManagedWireGuard:
             if self._path(name).exists() or interface_config.exists() or interface_config.is_symlink():
                 raise ManagedVpnError("Instance or interface configuration already exists")
             for item in self.state_root.iterdir():
+                if item.name in RESERVED_STATE_DIRECTORIES and self._administrative_directory(item):
+                    continue
                 if item.is_dir() and (item / "state.json").exists():
                     other = self._state(item.name)
                     if other["interface"] == iface or other["port"] == port or network.overlaps(validate_network(other["subnet"])):
@@ -701,6 +724,8 @@ class ManagedWireGuard:
         with self._locked():
             items = []
             for path in sorted(self.state_root.iterdir()):
+                if path.name in RESERVED_STATE_DIRECTORIES and self._administrative_directory(path):
+                    continue
                 if path.is_dir() and (path / "state.json").exists():
                     state = self._state(path.name)
                     items.append(self._public(state, active=self._runtime(state, (state,))))
