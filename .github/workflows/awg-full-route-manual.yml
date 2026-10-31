@@ -1,0 +1,47 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 Jigokuraku01
+# Additional author attribution terms: see ATTRIBUTION.md.
+name: Disposable AWG full route
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: awg-full-route-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  full-route:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v6
+      - name: Check disposable Ubuntu runner and TUN
+        shell: bash
+        run: |
+          set -euo pipefail
+          . /etc/os-release
+          test "$ID" = ubuntu
+          test "$VERSION_ID" = 24.04
+          test "$(uname -m)" = x86_64
+          test "$RUNNER_ENVIRONMENT" = github-hosted
+          if [ ! -c /dev/net/tun ]; then sudo modprobe tun; fi
+          test -c /dev/net/tun
+          docker info >/dev/null
+          if docker container inspect amnezia-awg2 >/dev/null 2>&1; then
+            echo 'Refusing to run with an existing amnezia-awg2 container' >&2
+            exit 1
+          fi
+      - name: Install fixture crypto dependency
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq python3-cryptography
+      - name: Provision AWG and check full-route client traffic
+        run: |
+          PYTHONDONTWRITEBYTECODE=1 /usr/bin/python3 -m lab.amnezia_provision_docker \
+            --i-understand-this-runs-disposable-docker \
+            --route full \
+            --verify-client-traffic
