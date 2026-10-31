@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright (C) 2026 Jigokuraku01
 # Additional author attribution terms: see ATTRIBUTION.md.
-"""Opt-in installation of the existing, narrowly scoped WireGuard broker.
+"""Opt-in WireGuard broker and sanitized inventory on an Agent-only host.
 
 This installer never creates a VPN interface or client.  A separate journal
 allows an interrupted installation to be rolled back without overwriting a
@@ -16,6 +16,7 @@ import binascii
 from contextlib import contextmanager
 from dataclasses import dataclass
 import fcntl
+import grp
 import hashlib
 import json
 import os
@@ -34,9 +35,15 @@ FILES = (
     ("sovagrid-vpn-broker", "/usr/local/libexec/sovagrid-vpn-broker", 0o755),
     ("sovagrid-vpn-control.service", "/etc/systemd/system/sovagrid-vpn-control.service", 0o644),
     ("sovagrid-vpn-control.socket", "/etc/systemd/system/sovagrid-vpn-control.socket", 0o644),
+    ("sovagrid-vpn-status-agent.service", "/etc/systemd/system/sovagrid-vpn-status.service", 0o644),
+    ("sovagrid-vpn-status.timer", "/etc/systemd/system/sovagrid-vpn-status.timer", 0o644),
 )
 SOCKET = "sovagrid-vpn-control.socket"
 SERVICE = "sovagrid-vpn-control.service"
+STATUS_SERVICE = "sovagrid-vpn-status.service"
+STATUS_TIMER = "sovagrid-vpn-status.timer"
+STATUS_DIR = "/var/lib/sovagrid-vpn-inventory"
+STATUS_FILE = STATUS_DIR + "/status.json"
 STATE_DIR = "/etc/sovagrid-vpn"
 MARKER = STATE_DIR + "/wireguard-control-install.json"
 JOURNAL = STATE_DIR + "/wireguard-control-install.pending.json"
@@ -118,10 +125,11 @@ def _sync_dir(path: Path) -> None:
         os.close(fd)
 
 
-def _atomic(path: Path, data: bytes, mode: int, owner: int) -> None:
+def _atomic(path: Path, data: bytes, mode: int, owner: int,
+            *, group: int | None = None) -> None:
     fd, temporary = tempfile.mkstemp(prefix=".sovagrid-wg-install-", dir=path.parent)
     try:
-        os.fchown(fd, owner, 0 if owner == 0 else os.getegid())
+        os.fchown(fd, owner, (0 if owner == 0 else os.getegid()) if group is None else group)
         with os.fdopen(fd, "wb") as output:
             fd = -1
             output.write(data)
@@ -146,11 +154,21 @@ def _remove(path: Path) -> None:
 class Installer:
     def __init__(self, layout: Layout = Layout(), *, owner: int = 0,
                  run: Callable = subprocess.run,
-                 dependencies: Callable[[], tuple[str, ...]] | None = None):
+                 dependencies: Callable[[], tuple[str, ...]] | None = None,
+                 agent_gid: int | None = None):
         self.layout = layout
         self.owner = owner
         self.run = run
         self.dependencies = dependencies or self._missing_dependencies
+        self.agent_gid = agent_gid
+
+    def _group_id(self) -> int:
+        if self.agent_gid is not None:
+            return self.agent_gid
+        try:
+            return grp.getgrnam("sovagrid").gr_gid
+        except KeyError as exc:
+            raise InstallError("SovaGrid Agent group is missing") from exc
 
     def _command(self, *argv: str, accepted: tuple[int, ...] = (0,),
                  timeout: int = 30, env: dict | None = None) -> int:
@@ -256,9 +274,12 @@ class Installer:
             result = json.loads(raw)
         except (ValueError, UnicodeError) as exc:
             raise InstallError("VPN installer marker is invalid") from exc
-        if (type(result) is not dict or result.get("schema_version") != 1 or
+        control_paths = {absolute for _, absolute, _ in FILES[:4]}
+        all_paths = {absolute for _, absolute, _ in FILES}
+        if (type(result) is not dict or result.get("schema_version") not in (1, 2) or
                 type(result.get("files")) is not dict or
-                set(result["files"]) != {absolute for _, absolute, _ in FILES} or
+                set(result["files"]) != (control_paths if result["schema_version"] == 1
+                                          else all_paths) or
                 any(not isinstance(value, str) or not HEX.fullmatch(value)
                     for value in result["files"].values())):
             raise InstallError("VPN installer marker is invalid")
@@ -290,24 +311,59 @@ class Installer:
                 raw, installed_mode = item
                 if installed_mode != mode:
                     raise InstallError("VPN installation has unsafe file mode")
-                expected = marker["files"][absolute] if marker else _sha(sources[name])
+                expected = marker["files"].get(absolute, _sha(sources[name])) if marker else _sha(sources[name])
                 if _sha(raw) != expected:
                     raise InstallError("Refusing to replace an unmanaged VPN file")
                 result[absolute] = item
             else:
-                if marker is not None:
+                if marker is not None and absolute in marker["files"]:
                     raise InstallError("Managed VPN file is missing")
                 result[absolute] = None
         return result
 
+    def _snapshot(self, marker: dict | None, *, owned_pending: bool = False) -> tuple[bytes, int] | None:
+        directory = self.layout.at(STATUS_DIR)
+        if not directory.exists() and not directory.is_symlink():
+            return None
+        _safe_dir(directory.parent, self.owner)
+        _safe_dir(directory, self.owner)
+        info = directory.lstat()
+        if stat.S_IMODE(info.st_mode) != 0o750 or info.st_gid != self._group_id():
+            raise InstallError("VPN inventory directory is unmanaged")
+        path = self.layout.at(STATUS_FILE)
+        item = _maybe_file(path, self.owner, limit=65536)
+        if item is None:
+            return None
+        file_info = path.lstat()
+        if (item[1] != 0o640 or file_info.st_gid != self._group_id() or
+                marker is None and not owned_pending):
+            raise InstallError("VPN inventory snapshot is unmanaged")
+        try:
+            parsed = json.loads(item[0])
+        except (ValueError, UnicodeError) as exc:
+            raise InstallError("VPN inventory snapshot is invalid") from exc
+        if (type(parsed) is not dict or parsed.get("schema_version") != 1 or
+                type(parsed.get("collected_at")) is not int or
+                parsed.get("source") != "docker_cli" or
+                parsed.get("source_status") not in ("ok", "error") or
+                type(parsed.get("services")) is not list or
+                type(parsed.get("managed")) is not dict):
+            raise InstallError("VPN inventory snapshot is invalid")
+        return item
+
     def _observe(self) -> tuple[dict, dict[str, bytes], dict]:
+        self._group_id()
         sources = self._source()
         marker = self._marker()
         destinations = self._destinations(sources, marker)
+        snapshot = self._snapshot(marker)
         pending = self._pending()
         active = self._active(SOCKET)
         service_active = self._active(SERVICE)
         enabled = self._enabled(SOCKET)
+        status_active = self._active(STATUS_TIMER)
+        status_enabled = self._enabled(STATUS_TIMER)
+        status_service_active = self._active(STATUS_SERVICE)
         missing = self.dependencies()
         current = all(destinations[absolute] is not None and
                       destinations[absolute][0] == sources[name]
@@ -318,14 +374,21 @@ class Installer:
                  "marker": _sha(_json(marker)) if marker else None,
                  "pending": pending, "socket_active": active,
                  "service_active": service_active, "socket_enabled": enabled,
+                 "status_timer_active": status_active, "status_timer_enabled": status_enabled,
+                 "status_service_active": status_service_active,
+                 "snapshot_present": snapshot is not None,
                  "missing_dependencies": missing}
         mutation_needed = not current
-        broker_busy = active or service_active or enabled
+        broker_busy = (active or service_active or enabled or status_active or
+                       status_enabled or status_service_active)
         preview = {"schema_version": 1, "action": "preview", "writes": False,
                    "state_revision": _sha(_json(state)), "source_revision":
                    _sha(_json(state["source"])), "installed_current": current,
                    "socket_active": active, "service_active": service_active,
                    "socket_enabled": enabled, "pending_recovery": pending,
+                   "inventory_timer_active": status_active,
+                   "inventory_timer_enabled": status_enabled,
+                   "inventory_snapshot_present": snapshot is not None,
                    "missing_dependencies": list(missing),
                    "apparmor_profile_present": self.layout.at("/etc/apparmor.d/wg-quick").exists(),
                    "can_apply": not pending and not (mutation_needed and broker_busy),
@@ -333,7 +396,7 @@ class Installer:
         if pending:
             preview["reason"] = "RECOVERY_REQUIRED"
         elif mutation_needed and broker_busy:
-            preview["reason"] = "STOP_BROKER_BEFORE_UPGRADE"
+            preview["reason"] = "STOP_VPN_UNITS_BEFORE_UPGRADE"
         return preview, sources, destinations
 
     def preview(self) -> dict:
@@ -393,6 +456,16 @@ class Installer:
                 os.chown(path, self.owner, 0 if self.owner == 0 else os.getegid())
                 _sync_dir(path.parent)
             _safe_dir(path, self.owner, private=mode == 0o700)
+        status = self.layout.at(STATUS_DIR)
+        if not status.exists() and not status.is_symlink():
+            _safe_dir(status.parent, self.owner)
+            status.mkdir(mode=0o750)
+            os.chown(status, self.owner, self._group_id())
+            _sync_dir(status.parent)
+        _safe_dir(status, self.owner)
+        info = status.lstat()
+        if stat.S_IMODE(info.st_mode) != 0o750 or info.st_gid != self._group_id():
+            raise InstallError("VPN inventory directory is unmanaged")
 
     @staticmethod
     def _encode(item: tuple[bytes, int] | None) -> dict | None:
@@ -403,7 +476,7 @@ class Installer:
         if item is None:
             return None
         if (type(item) is not dict or set(item) != {"data", "mode"} or
-                type(item["mode"]) is not int or item["mode"] not in (0o600, 0o644, 0o755) or
+                type(item["mode"]) is not int or item["mode"] not in (0o600, 0o640, 0o644, 0o755) or
                 type(item["data"]) is not str):
             raise InstallError("VPN installer journal is invalid")
         try:
@@ -424,7 +497,7 @@ class Installer:
         except (ValueError, UnicodeError) as exc:
             raise InstallError("VPN installer journal is invalid") from exc
         paths = {absolute for _, absolute, _ in FILES}
-        if (type(value) is not dict or value.get("schema_version") != 1 or
+        if (type(value) is not dict or value.get("schema_version") != 2 or
                 type(value.get("old_files")) is not dict or set(value["old_files"]) != paths or
                 type(value.get("new_hashes")) is not dict or set(value["new_hashes"]) != paths or
                 any(not isinstance(digest, str) or not HEX.fullmatch(digest)
@@ -433,7 +506,10 @@ class Installer:
                 not HEX.fullmatch(value["new_marker_hash"]) or
                 type(value.get("socket_active")) is not bool or
                 type(value.get("socket_enabled")) is not bool or
-                type(value.get("service_active")) is not bool):
+                type(value.get("service_active")) is not bool or
+                type(value.get("status_timer_active")) is not bool or
+                type(value.get("status_timer_enabled")) is not bool or
+                type(value.get("status_service_active")) is not bool):
             raise InstallError("VPN installer journal is invalid")
         for _, absolute, mode in FILES:
             old = self._decode(value["old_files"][absolute])
@@ -441,6 +517,9 @@ class Installer:
                 raise InstallError("VPN installer journal is invalid")
         old_marker = self._decode(value.get("old_marker"))
         if old_marker is not None and old_marker[1] != 0o600:
+            raise InstallError("VPN installer journal is invalid")
+        old_snapshot = self._decode(value.get("old_snapshot"))
+        if old_snapshot is not None and old_snapshot[1] != 0o640:
             raise InstallError("VPN installer journal is invalid")
         return value
 
@@ -467,7 +546,16 @@ class Installer:
         if current_marker is not None and current_marker != old_marker:
             if _sha(current_marker[0]) != value.get("new_marker_hash"):
                 raise InstallError("VPN install marker changed externally")
-        # Stop only our fixed broker unit. No wg-quick or VPN interface is touched.
+        old_snapshot = self._decode(value.get("old_snapshot"))
+        current_snapshot = self._snapshot(self._marker(), owned_pending=True)
+        if old_snapshot is not None and current_snapshot is None:
+            raise InstallError("VPN inventory snapshot changed externally")
+        # Stop only the fixed inventory and broker units. No wg-quick or VPN
+        # interface is touched.
+        if self._active(STATUS_TIMER) or self._enabled(STATUS_TIMER):
+            self._command(SYSTEMCTL, "disable", "--now", STATUS_TIMER)
+        if self._active(STATUS_SERVICE):
+            self._command(SYSTEMCTL, "stop", STATUS_SERVICE)
         if self._active(SERVICE):
             self._command(SYSTEMCTL, "stop", SERVICE)
         if self._active(SOCKET) or self._enabled(SOCKET):
@@ -485,6 +573,13 @@ class Installer:
                 _remove(marker)
         elif current_marker != old_marker:
             _atomic(marker, old_marker[0], old_marker[1], self.owner)
+        snapshot_path = self.layout.at(STATUS_FILE)
+        if old_snapshot is None:
+            if current_snapshot is not None:
+                _remove(snapshot_path)
+        elif current_snapshot != old_snapshot:
+            _atomic(snapshot_path, old_snapshot[0], old_snapshot[1], self.owner,
+                    group=self._group_id())
         self._command(SYSTEMCTL, "daemon-reload")
         if value["socket_enabled"]:
             self._command(SYSTEMCTL, "enable", SOCKET)
@@ -492,6 +587,12 @@ class Installer:
             self._command(SYSTEMCTL, "start", SOCKET)
         if value["service_active"]:
             self._command(SYSTEMCTL, "start", SERVICE)
+        if value["status_timer_enabled"]:
+            self._command(SYSTEMCTL, "enable", STATUS_TIMER)
+        if value["status_timer_active"]:
+            self._command(SYSTEMCTL, "start", STATUS_TIMER)
+        if value["status_service_active"]:
+            self._command(SYSTEMCTL, "start", STATUS_SERVICE)
         _remove(self.layout.at(JOURNAL))
 
     def recover(self) -> dict:
@@ -520,18 +621,23 @@ class Installer:
         self._ensure_dependencies(preview["missing_dependencies"])
         self._ensure_directories()
         old_marker = _maybe_file(self.layout.at(MARKER), self.owner, private=True)
-        new_marker = {"schema_version": 1,
+        old_snapshot = self._snapshot(self._marker())
+        new_marker = {"schema_version": 2,
                       "files": {absolute: _sha(sources[name]) for name, absolute, _ in FILES}}
         new_marker_raw = _json(new_marker)
-        journal = {"schema_version": 1,
+        journal = {"schema_version": 2,
                    "old_files": {absolute: self._encode(item)
                                  for absolute, item in destinations.items()},
                    "new_hashes": new_marker["files"],
                    "old_marker": self._encode(old_marker),
+                   "old_snapshot": self._encode(old_snapshot),
                    "new_marker_hash": _sha(new_marker_raw),
                    "socket_active": preview["socket_active"],
                    "socket_enabled": preview["socket_enabled"],
-                   "service_active": preview["service_active"]}
+                   "service_active": preview["service_active"],
+                   "status_timer_active": preview["inventory_timer_active"],
+                   "status_timer_enabled": preview["inventory_timer_enabled"],
+                   "status_service_active": self._active(STATUS_SERVICE)}
         _atomic(self.layout.at(JOURNAL), _json(journal), 0o600, self.owner)
         try:
             for name, absolute, mode in FILES:
@@ -540,7 +646,7 @@ class Installer:
             # Verify after the fixed ExecStart launchers are installed. The
             # journal already covers every possible failure at this point.
             self._command(ANALYZE, "verify", *(str(self.layout.at("/etc/systemd/system") / name)
-                       for name in (SERVICE, SOCKET)))
+                       for name in (SERVICE, SOCKET, STATUS_SERVICE, STATUS_TIMER)))
             self._command(SYSTEMCTL, "daemon-reload")
             self._command(SYSTEMCTL, "enable", "--now", SOCKET)
             self._command(SYSTEMCTL, "start", SERVICE)
@@ -550,6 +656,12 @@ class Installer:
                 self._command("/usr/bin/python3", "-I", "-B",
                               str(self.layout.repo / "deploy/install-wg-quick-apparmor.py"),
                               timeout=30)
+            self._command(SYSTEMCTL, "start", STATUS_SERVICE)
+            if self._snapshot(self._marker(), owned_pending=True) is None:
+                raise InstallError("VPN inventory did not produce a snapshot")
+            self._command(SYSTEMCTL, "enable", "--now", STATUS_TIMER)
+            if not self._active(STATUS_TIMER):
+                raise InstallError("VPN inventory timer did not become active")
             _atomic(self.layout.at(MARKER), new_marker_raw, 0o600, self.owner)
             _remove(self.layout.at(JOURNAL))
         except BaseException:
@@ -561,6 +673,7 @@ class Installer:
             raise
         return {"action": "installed", "socket_active": True,
                 "service_active": True, "vpn_interface_changed": False,
+                "inventory_timer_active": True, "inventory_snapshot_present": True,
                 "source_revision": preview["source_revision"]}
 
 

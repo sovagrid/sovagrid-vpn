@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 import shutil
 import tempfile
@@ -12,18 +13,24 @@ import unittest
 from unittest.mock import patch
 
 from sovagrid_vpn.wireguard_install import (FILES, InstallError, Installer, Layout,
-                                            JOURNAL, MARKER, SOURCE_LOCK)
+                                            JOURNAL, MARKER, SOURCE_LOCK,
+                                            STATUS_FILE)
 
 
 class FakeSystem:
-    def __init__(self):
+    def __init__(self, root: Path):
+        self.root = root
         self.commands = []
         self.active = {"sovagrid-vpn-control.socket": False,
-                       "sovagrid-vpn-control.service": False}
+                       "sovagrid-vpn-control.service": False,
+                       "sovagrid-vpn-status.timer": False,
+                       "sovagrid-vpn-status.service": False}
         self.enabled = False
+        self.timer_enabled = False
         self.fail_service_once = False
         self.fail_apparmor_once = False
         self.fail_verify_once = False
+        self.fail_status_timer_once = False
         self.apt_installed = False
 
     def __call__(self, argv, **_):
@@ -33,13 +40,24 @@ class FakeSystem:
         if argv[1] == "is-active":
             result = 0 if self.active[argv[-1]] else 3
         elif argv[1] == "is-enabled":
-            result = 0 if self.enabled else 1
+            result = 0 if (self.timer_enabled if argv[-1].endswith("status.timer")
+                           else self.enabled) else 1
         elif argv[1:3] == ("enable", "--now"):
-            self.active[argv[-1]] = True
-            self.enabled = True
+            if argv[-1].endswith("status.timer") and self.fail_status_timer_once:
+                self.fail_status_timer_once = False
+                result = 1
+            else:
+                self.active[argv[-1]] = True
+                if argv[-1].endswith("status.timer"):
+                    self.timer_enabled = True
+                else:
+                    self.enabled = True
         elif argv[1:3] == ("disable", "--now"):
             self.active[argv[-1]] = False
-            self.enabled = False
+            if argv[-1].endswith("status.timer"):
+                self.timer_enabled = False
+            else:
+                self.enabled = False
         elif argv[1] == "stop":
             self.active[argv[-1]] = False
         elif argv[1] == "start":
@@ -47,7 +65,14 @@ class FakeSystem:
                 self.fail_service_once = False
                 result = 1
             else:
-                self.active[argv[-1]] = True
+                if argv[-1] == "sovagrid-vpn-status.service":
+                    target = self.root / STATUS_FILE.lstrip("/")
+                    target.write_text(json.dumps({"schema_version": 1, "collected_at": 1,
+                                                  "source": "docker_cli", "source_status": "error",
+                                                  "services": [], "managed": {}}) + "\n")
+                    target.chmod(0o640)
+                else:
+                    self.active[argv[-1]] = True
         elif argv[0].endswith("apt-get") and argv[1] == "install":
             self.apt_installed = True
         elif argv[0] == "/usr/bin/python3" and argv[-1].endswith("install-wg-quick-apparmor.py"):
@@ -85,10 +110,10 @@ class WireGuardInstallerTests(unittest.TestCase):
         source_lock.parent.mkdir(parents=True, mode=0o700)
         source_lock.write_bytes(b"")
         source_lock.chmod(0o600)
-        self.system = FakeSystem()
+        self.system = FakeSystem(self.root)
         self.installer = Installer(Layout(self.root, self.repo),
                                    owner=self.root.stat().st_uid, run=self.system,
-                                   dependencies=lambda: ())
+                                   dependencies=lambda: (), agent_gid=self.root.stat().st_gid)
 
     def test_preview_is_read_only_and_apply_does_not_start_vpn_interface(self):
         before = sorted(str(path.relative_to(self.root)) for path in self.root.rglob("*"))
@@ -99,6 +124,11 @@ class WireGuardInstallerTests(unittest.TestCase):
         self.assertFalse(preview["installed_current"])
         result = self.installer.apply(preview["state_revision"])
         self.assertTrue(result["socket_active"])
+        self.assertTrue(result["inventory_timer_active"])
+        self.assertTrue((self.root / STATUS_FILE.lstrip("/")).exists())
+        self.assertEqual((self.root / STATUS_FILE.lstrip("/")).stat().st_mode & 0o777, 0o640)
+        self.assertEqual((self.root / "etc/systemd/system/sovagrid-vpn-status.service").read_bytes(),
+                         (self.repo / "deploy/sovagrid-vpn-status-agent.service").read_bytes())
         self.assertFalse(result["vpn_interface_changed"])
         self.assertTrue((self.root / MARKER.lstrip("/")).exists())
         self.assertFalse((self.root / JOURNAL.lstrip("/")).exists())
@@ -143,10 +173,12 @@ class WireGuardInstallerTests(unittest.TestCase):
             (self.repo / "deploy/sovagrid-vpn-ctl").read_bytes() + b"\n# update\n")
         blocked = self.installer.preview()
         self.assertFalse(blocked["can_apply"])
-        self.assertEqual(blocked["reason"], "STOP_BROKER_BEFORE_UPGRADE")
+        self.assertEqual(blocked["reason"], "STOP_VPN_UNITS_BEFORE_UPGRADE")
         self.system.active["sovagrid-vpn-control.socket"] = False
         self.system.active["sovagrid-vpn-control.service"] = False
+        self.system.active["sovagrid-vpn-status.timer"] = False
         self.system.enabled = False
+        self.system.timer_enabled = False
         accepted = self.installer.preview()
         self.assertTrue(accepted["can_apply"])
         self.installer.apply(accepted["state_revision"])
@@ -227,6 +259,69 @@ class WireGuardInstallerTests(unittest.TestCase):
         source.write_bytes(source.read_bytes() + b"\n# next revision\n")
         with self.assertRaisesRegex(InstallError, "stale"):
             self.installer.apply(preview["state_revision"])
+
+    def test_status_timer_failure_rolls_back_snapshot_and_units(self):
+        self.system.fail_status_timer_once = True
+        with self.assertRaises(InstallError):
+            self.installer.apply(self.installer.preview()["state_revision"])
+        self.assertFalse(self.system.enabled)
+        self.assertFalse(self.system.timer_enabled)
+        self.assertFalse((self.root / STATUS_FILE.lstrip("/")).exists())
+        self.assertFalse((self.root / MARKER.lstrip("/")).exists())
+        self.assertFalse((self.root / JOURNAL.lstrip("/")).exists())
+        for _, absolute, _ in FILES:
+            self.assertFalse((self.root / absolute.lstrip("/")).exists())
+
+    def test_foreign_inventory_snapshot_refused(self):
+        snapshot = self.root / STATUS_FILE.lstrip("/")
+        snapshot.parent.mkdir(mode=0o750)
+        snapshot.write_text(json.dumps({"schema_version": 1, "collected_at": 1,
+                                        "source": "docker_cli", "source_status": "error",
+                                        "services": [], "managed": {}}) + "\n")
+        snapshot.chmod(0o640)
+        preview = self.installer.preview()
+        self.assertFalse(preview["can_apply"])
+        self.assertIn("unmanaged", preview["reason"])
+        self.assertTrue(snapshot.exists())
+
+    def test_foreign_inventory_unit_refused(self):
+        unit = self.root / "etc/systemd/system/sovagrid-vpn-status.service"
+        unit.write_bytes(b"[Unit]\nDescription=foreign\n")
+        preview = self.installer.preview()
+        self.assertFalse(preview["can_apply"])
+        self.assertIn("unmanaged", preview["reason"])
+        self.assertEqual(unit.read_bytes(), b"[Unit]\nDescription=foreign\n")
+
+    def test_interrupted_inventory_install_recovers_owned_snapshot(self):
+        self.system.fail_status_timer_once = True
+        with patch.object(self.installer, "_rollback", side_effect=InstallError("interrupted")):
+            with self.assertRaises(InstallError):
+                self.installer.apply(self.installer.preview()["state_revision"])
+        self.assertTrue((self.root / STATUS_FILE.lstrip("/")).exists())
+        self.assertEqual(self.installer.preview()["reason"], "RECOVERY_REQUIRED")
+        self.assertTrue(self.installer.recover()["changed"])
+        self.assertFalse((self.root / STATUS_FILE.lstrip("/")).exists())
+
+    def test_failed_upgrade_restores_previous_snapshot(self):
+        self.installer.apply(self.installer.preview()["state_revision"])
+        snapshot = self.root / STATUS_FILE.lstrip("/")
+        previous = json.dumps({"schema_version": 1, "collected_at": 123,
+                               "source": "docker_cli", "source_status": "ok",
+                               "services": [], "managed": {}}).encode() + b"\n"
+        snapshot.write_bytes(previous)
+        snapshot.chmod(0o640)
+        self.system.active["sovagrid-vpn-control.socket"] = False
+        self.system.active["sovagrid-vpn-control.service"] = False
+        self.system.active["sovagrid-vpn-status.timer"] = False
+        self.system.enabled = False
+        self.system.timer_enabled = False
+        source_unit = self.repo / "deploy/sovagrid-vpn-status-agent.service"
+        source_unit.write_bytes(source_unit.read_bytes() + b"\n# next revision\n")
+        self.system.fail_status_timer_once = True
+        with self.assertRaises(InstallError):
+            self.installer.apply(self.installer.preview()["state_revision"])
+        self.assertEqual(snapshot.read_bytes(), previous)
+        self.assertFalse((self.root / JOURNAL.lstrip("/")).exists())
 
 
 if __name__ == "__main__":

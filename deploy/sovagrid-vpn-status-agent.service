@@ -1,0 +1,22 @@
+# Managed by SovaGrid Agent-only WireGuard installer
+[Unit]
+Description=SovaGrid sanitized VPN inventory for a standalone Agent
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/sovagrid-vpn
+Environment=PYTHONDONTWRITEBYTECODE=1
+ExecStart=/usr/bin/python3 -m sovagrid_vpn --output /var/lib/sovagrid-vpn-inventory/status.json --group sovagrid
+# Docker may be unavailable; the independent managed snapshot is still written.
+SuccessExitStatus=2
+User=root
+Group=root
+SupplementaryGroups=sovagrid
+NoNewPrivileges=yes
+CapabilityBoundingSet=CAP_NET_ADMIN
+ProtectSystem=strict
+ReadWritePaths=/var/lib/sovagrid-vpn-inventory
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+RestrictAddressFamilies=AF_UNIX AF_NETLINK
